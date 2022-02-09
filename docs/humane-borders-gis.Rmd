@@ -1,0 +1,1334 @@
+---
+title: "AZ OpenGIS Data Exploration"
+author: "Nathan Craig"
+date: "1/21/2022"
+output: bookdown::html_document2
+  # html_document:
+  #   df_print: paged
+---
+# Introduction
+
+<style>
+.leaflet {
+    margin: auto;
+}
+</style>
+
+
+```{r setup, include=FALSE}
+# create custom hook for knitr
+inline_hook <- function(x){
+	if(is.numeric(x)){
+		if(abs(x - round(x)) < .Machine$double.eps){
+			# treat as integer
+			formatted <- format(x, digits=0, big.mark = ",")
+		} else {
+			# treat as floating point number
+			formatted <- format(x, digits=2, nsmall=2, big.mark = ",")
+		}
+	} else {
+		formatted <-x
+	}
+  formatted
+}
+# call custom formatting hook
+knitr::knit_hooks$set(inline=inline_hook)
+
+knitr::opts_chunk$set(echo = FALSE)
+options(max.print=1000000)
+```
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidyr)
+library(readr)
+library(lubridate)
+library(scales)
+
+library(e1071)
+
+library(ggplot2)
+library(ggforce)
+library(patchwork)
+
+library(leaflet)
+library(htmltools)
+
+library(knitr)
+library(kableExtra)
+```
+
+This document is an effort to supply basic summaries and exploration of the Arizona OpenGIS Initiative for Deceased Migrants ([OGIS](https://humaneborders.info/)) Migrant Mortality [data](https://humaneborders.info/app/map.asp) using methods of reproducible research.
+
+# Data Import
+Presently, the data are downloaded from the server and stored locally as a CSV file. That file is then read into R and analysis takes place in R Markdown. Ideally, the file would be retrieved directly from the server using an API request. At present, characters in the file that are returned cause import errors. This issue is resolvable with a very minor edit (see Appendix B) and will hopefully be sorted out server side in the near future. For now, circumstances dictate saving the file locally and modifying it before it can be properly read into R.
+
+```{r read-data-modified, message=FALSE, warning=FALSE}
+df <- read_csv(here::here("data/ogis_migrant_deaths_29jan2022.csv"))
+```
+
+```{r clean-data, message=FALSE, warning=FALSE}
+
+# Remove erroneous data frames from above
+remove("df_api", "df_csv", "df_csv_opened")
+
+# Get consistent casing
+df$Name <- str_to_title(df$Name)
+df$Sex <- str_to_title(df$Sex)
+
+# Separate Reporting Date into components
+df <- df %>% mutate(
+  Year = year(`Reporting Date`),
+  Month = month(`Reporting Date`, label = TRUE),
+  Day = day(`Reporting Date`),
+  .after = `Reporting Date`)
+
+
+
+
+# Convert select columns to factors
+col_names <- c("Name",
+               "Sex",
+               "Month",
+               "Surface Management",
+               "Location Precision",
+               "Corridor",
+               "Cause of Death",
+               "Body Condition",
+               "Post Mortem Interval",
+               "State",
+               "County")
+df[col_names] <- lapply(df[col_names], factor)
+
+# Manually reorder factor
+df$`Post Mortem Interval` <- fct_relevel(df$`Post Mortem Interval`,
+            "< 1 day",
+            "< 1 week",
+            "< 3 weeks",
+            "< 5 weeks",
+            "< 3 months",
+            "< 6-8 months",
+            "> 6-8 months",
+            "Undetermined"
+            )
+
+# create new factors to hold NA
+df$`Post Mortem Interval` <- fct_expand(df$`Post Mortem Interval`, "Undetermined")
+
+# Deal with NA's
+df <- df %>% 
+  replace_na(list(
+    Sex="Undetermined",
+    # Age="Undetermined",
+    `Cause of Death` = "Undetermined",
+    `OME Determined COD` = "UNDETERMINED",
+    `Body Condition` = "Other",
+    # The following line was throwing errors
+    # Should be revisited
+    `Post Mortem Interval` = "Undetermined"
+    ))
+
+
+
+
+
+
+# Clean up names
+df <- df %>% 
+  separate(Name, c("Last Name", "First Name"), ",", remove = FALSE) %>% 
+  mutate(`Full Name` = paste(`First Name`, `Last Name`, sep = " "), .after = `First Name`) %>% 
+  arrange(`Last Name`)
+
+df$`Full Name` <-gsub("NA ","",as.character(df$`Full Name`))
+
+```
+
+# Summaries
+
+```{r summary-general}
+# Get the number of records
+n_deaths <- nrow(df)
+```
+
+Currently the OGIS data set contains `r n_deaths` fatalities.
+
+```{r map, fig.align='center'}
+#| fig.cap = "Map of all fatalities in the AZ OGIS database"
+
+df$label <-  paste0("Name: ", df$Name,"<br>",
+                         "Age: ", df$Age, "<br>",
+                         "Date: ",df$`Reporting Date`)
+df %>% 
+  leaflet() %>%
+  setView(lng = -112, lat = 33, zoom = 7.4) %>%  
+  addCircleMarkers(lng = ~Longitude,
+                   lat = ~Latitude,
+                   radius = .05,
+                   color = "Red",
+                   popup = df$label) %>% 
+  addProviderTiles(providers$Esri.NatGeoWorldMap) %>% 
+  addMeasure()
+  # addMiniMap(toggleDisplay = TRUE)
+```
+
+## Names
+
+```{r names-counts}
+# Count the number of identified individuals
+name_unid <- df %>% 
+  filter(Name == "Unidentified") %>% 
+  nrow()
+
+# Count the number of unidentified individuals
+name_id <- df %>% 
+  filter(Name != "Unidentified") %>% 
+  nrow()
+
+```
+
+One of the purposes of OGIS is to attempt identification of unidentified deceased individuals. At present, of the `r n_deaths` fatalities in the OGIS data set, `r (name_unid / n_deaths) * 100`% individuals remain unidentified (n= `r name_unid`) while `r (name_id / n_deaths) * 100`% persons are identified (n= `r name_id`, see Appendix A).
+
+## Sex
+
+```{r sex-table}
+
+sex_female <- df %>% 
+  filter(Sex == "Female") %>% 
+  nrow()
+
+sex_male <- df %>% 
+  filter(Sex == "Male") %>% 
+  nrow()
+
+sex_undetermined <- df %>% 
+  filter(Sex == "Undetermined") %>% 
+  nrow()
+
+# Obtain counts by Sex
+df %>% 
+  group_by(Sex) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  kbl(caption = "Table showing total number of fatalities in AZ OGIS by sex determination") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                position = "float_right")
+```
+
+Sex remains undetermined for `r (sex_undetermined/n_deaths)*100`% (n= `r sex_undetermined`) of the `r n_deaths` fatalities in the OGIS data set. Sex was determined for `r sex_female + sex_male` of the fatalities, and among these `r (sex_female/n_deaths)*100`% (n= `r sex_female`) are females and `r (sex_male/n_deaths)*100`% (n= `r sex_male`) are males. Based on this sample, among migrant fatalities the total population sex ratio is `r (sex_male / sex_female)*100`. Normal sex ratios are generally close to 1, so a sex ratio of `r (sex_male / sex_female)*100` is highly unusual in a normal population. The population of migrant fatalities in OGIS is heavily male weighted.
+
+<!-- sex ratio over time would be an interesting thing to track, group by year and perform the same operation -->
+
+```{r map-sex}
+#| fig.cap = "Map of fatalities by sex for individuals whose sex was determined."
+# df$label <-  paste0("Name: ", df$Name,"<br>",
+#                          "Age: ", df$Age, "<br>",
+#                          "Date: ",df$`Reporting Date`)
+
+pal <- colorFactor(palette = "Set1",
+                   domain = df$Sex)
+
+df %>% 
+  filter(Sex != "Undetermined") %>% 
+  leaflet() %>%
+  setView(lng = -112, lat = 33, zoom = 7.4) %>%  
+  addCircleMarkers(lng = ~Longitude,
+                   lat = ~Latitude,
+                   radius = 0.5,
+                   color = ~pal(Sex),
+                   popup = df$label) %>% 
+  addProviderTiles(providers$Esri.NatGeoWorldMap) %>% 
+  addMeasure() %>% 
+  addLegend(pal=pal, values = ~Sex)
+  # addMiniMap(toggleDisplay = TRUE)
+
+```
+
+## Age
+
+```{r age-variables}
+age_undet <- df %>% 
+  filter(is.na(Age)) %>% 
+  nrow()
+
+age_det <- df %>% 
+  filter(!is.na(Age)) %>% 
+  nrow()
+
+# Count the number of minors
+age_n_minor <- df %>% 
+  drop_na(Age) %>% 
+  filter(Age < 18) %>% 
+  count()
+
+# Count seniors
+# Count the number of minors
+age_n_senior <- df %>% 
+  drop_na(Age) %>% 
+  filter(Age > 65) %>% 
+  count()
+
+# Changed NA to Undetermined
+s_w_test_age <- shapiro.test(df$Age[df$Age<99])
+```
+
+```{r age-summary}
+# Obtain counts by Age
+# df %>% 
+#   drop_na(Age) %>% 
+#   filter(Age < 99) %>%
+#   summarise(.,
+#             Minimum = min(Age),
+#             Maximum = max(Age),
+#             Mean = mean(Age),
+#             `Standard Deviation` = sd(Age),
+#             Median = median(Age)
+#          )
+
+# Create a table of fatalities by Age
+# df %>%
+#   drop_na(Age) %>% 
+#   group_by(Age) %>%
+#   summarise(n = n()) %>%
+#   arrange(desc(n))
+```
+
+```{r age-table-by-sex}
+df %>%
+  drop_na(Age) %>%
+  filter(Sex != "Undetermined") %>%
+  group_by(Sex) %>%
+  summarise(Mean = mean(Age, na.rm = TRUE),
+            SD = sd(Age, na.rm = TRUE),
+            Median = median(Age, na.rm = TRUE)) %>%
+  kbl(digits = 2,
+      caption = "Table showing mean, standard deviation, and median ages by sex among the fatalities in the AZ OGIS") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                position = "float_right")
+
+  
+```
+
+Age is undetermined for `r (age_undet/n_deaths)*100`% (n= `r age_undet`) and determined for `r (age_det/n_deaths)*100`% (n= `r age_det`) of the fatalities in the OGIS data set (n= `r n_deaths`). The fatalities ranged in age from `r min(df$Age, na.rm = TRUE)` to `r max(df$Age, na.rm = TRUE)`; `r age_n_minor$n` are minors (<18) and `r age_n_senior$n` are seniors (>65). The individuals with an age of 0 are less than 1 year old. The individual whose age is reported as 99 years is skeletal remains. I do not know the reason for this aged estimation. It is removed from analysis of the Age distribution. The next oldest person is `r max(df$Age[df$Age<99], na.rm = T)`.
+
+A Shapiro-Wilk normality test found the Age distribution is significantly different from a normal distribution ($W$= `r s_w_test_age$statistic`, $p$= `r pvalue(s_w_test_age$p.value, accuracy = 0.01)`). The distribution is moderately left skewed (skew = `r skewness(df$Age[df$Age<99], na.rm = T)`). Among fatalities with age determinations, mean age was `r mean(df$Age[df$Age<99], na.rm = TRUE)` ($SD$= `r sd(df$Age[df$Age<99], na.rm = TRUE)`) years old. Median age is `r mean(df$Age[df$Age<99], na.rm = TRUE)` years old, which is close to the [global median](https://ourworldindata.org/age-structure).
+
+```{r plot-age-density, warning=FALSE}
+#| fig.cap = "Density plot of Age grouped by Sex."
+p1 <- df %>% 
+  filter(Sex != "Undetermined") %>% 
+  filter(Age < 99) %>% 
+  ggplot() +
+  aes(x = Age, fill = Sex, colour = Sex) +
+  geom_density(adjust = 1L, alpha = .5) +
+  scale_colour_brewer(palette = "Set1")+
+  scale_fill_brewer(palette="Set1")+
+  # labs(title = "Fatalities age by sex")+
+  ylab("Density")
+
+```
+
+
+```{r plot-age-sina, warning=FALSE}
+#| fig.cap = "Violin-Sina-Box plot of Age grouped by Sex."
+
+p2 <- df %>%
+  filter(Sex != "Undetermined") %>% 
+  filter(Age < 99) %>% 
+  ggplot(aes(x = Sex, y = Age, color = Sex))+
+  geom_violin(alpha=.1)+
+  geom_boxplot(width = 0.1, alpha=.7)+
+  geom_sina(alpha=0.4, size = .5)+
+  scale_colour_brewer(palette = "Set1")+
+  scale_fill_brewer(palette="Set1")+
+  # labs(title = "Fatalities age by sex")+
+  theme(legend.position = "none")
+```
+
+
+```{r plot-age-combined}
+#| fig.cap = "Plots of age distributions by sex among fatalities in the OGIS data base. A) is a density plot of male and female ages. B) is a violin-sina-box plot of the same distribution which helps to illustrate differences in the sizes of the two populations."
+patchwork <- p1 + p2
+patchwork + plot_annotation(
+  title = "Age Distributions by Sex",
+  caption = "Data Source: AZ OGIS https://humaneborders.info",
+  tag_levels = "A"
+)
+```
+
+
+
+```{r map-age, message=FALSE, warning=FALSE}
+#| fig.cap = "Map of fatalities for which age is determined."
+# df$label <-  paste0("Name: ", df$Name,"<br>",
+#                          "Age: ", df$Age, "<br>",
+#                          "Date: ",df$`Reporting Date`)
+
+# pal <- colorFactor(palette = "Spectral",
+#                    domain = df$Age)
+
+df_age <- df %>% 
+  drop_na(Age) %>% 
+  filter(Age < 99)
+
+pal <- colorNumeric(c("red", "green", "blue"), min(df_age$Age):max(df_age$Age))
+
+
+
+df_age %>% 
+    leaflet() %>%
+  setView(lng = -112, lat = 33, zoom = 7.4) %>%  
+  addCircleMarkers(lng = ~Longitude,
+                   lat = ~Latitude,
+                   radius = 0.5,
+                   color = ~pal(Age),
+                   popup = df_age$label) %>% 
+  addProviderTiles(providers$Esri.NatGeoWorldMap) %>% 
+  addMeasure() %>% 
+  addLegend(pal=pal, values = ~Age)
+  # addMiniMap(toggleDisplay = TRUE)
+
+remove(df_age)
+```
+
+
+# Reporting Date
+
+All records have a reporting date. This makes it possible to look at annual and monthly averages.
+
+## Annual Summaries
+
+```{r annual-summary-stats}
+df_year <- df %>% 
+  group_by(Year) %>% 
+  summarize(Count = n())
+
+df_year_sh_test <- shapiro.test(df_year$Count)
+
+# Get the index of the max
+x <- which.max(df_year$Count)
+
+# Return the max value
+df_year_max_year <- toString(df_year[x, ]$Year)
+```
+
+Based on the entire data set, there are an average of `r mean(df_year$Count)` fatalities per year (SD= `r sd(df_year$Count)`). A Shapiro-Wilk test finds annual average fatality counts deviate significantly from a normal distribution ($W$= `r df_year_sh_test$statistic`, $p$= `r pvalue(df_year_sh_test$p.value, accuracy = 0.01)`). No outliers were detected which is likely due to the high variability in annual fatalities over time (Mdn=`r median(df_year$Count)`, IQR= `r IQR(df_year$Count)`). `r df_year_max_year` saw the highest number of deaths (n= `r max(df_year$Count)`).
+
+
+```{r plot-deaths-per-year}
+#| fig.cap = "Plot of the number of fatalities reported per year. Note some fatalities occurred well prior to the reporting date."
+
+df %>% 
+  drop_na(Year) %>% 
+  group_by(Year) %>% 
+  summarize(Count = n()) %>% 
+  ggplot(aes(x=Year, y=Count))+
+  geom_line()+
+  
+  # Border wall construction
+  # geom_vline(xintercept=c(1994, 1998, 2011, 2017))+
+
+#### Humanitarian Aid Groups ####
+  # geom_vline(xintercept = c(2000,2002,2004), linetype = "dashed", alpha= 0.7)+
+  # geom_curve(data = data.frame(x = 2006.25193527165,
+  #                              y = 69.6677315323358,
+  #                              xend = 2002.24818434003,
+  #                              yend = 68.9370995129978),
+  #            mapping = aes(x = x, y = y, xend = xend, yend = yend),
+  #            angle = 0L, arrow = arrow(30L, unit(0.1, "inches"),
+  #                                      "last", "closed"),
+  #            inherit.aes = FALSE) + 
+  # geom_text(data = data.frame(x = c(2008, 1996,2009),
+  #                             y = c(127, 185, 75),
+  #                             label = c("No More Deaths \n Founded", "Humane Borders \n Founded", "Tucson Samaritans \n Founded"
+  #                                       )),
+  #           mapping = aes(x = x, y = y, label = label),
+  #           inherit.aes = FALSE)
+  labs(title = "Fatalities Reported by Year",
+       subtitle = "Some fatalities have a long post mortem interval",
+       caption = "Data Source: AZ OGIS https://humaneborders.info")+
+  ylab("Fatality Count")
+```
+
+```{r filter-deaths-year}
+df_year_deaths_recent <- df %>% 
+  filter(`Post Mortem Interval` %in% c("< 1 day", "< 1 week", "< 3 weeks", "< 5 weeks", "< 3 months", "< 6-8 months"))
+
+df_year_deaths_not_recent <- df %>%
+  filter(`Post Mortem Interval` %in% c("> 6-8 months"))
+```
+
+```{r yearly-post-mortem-comparison, message=FALSE, warning=FALSE}
+
+### Yearly Deaths Recent Post Mortem ####
+# Get monthly totals
+df_year_deaths_recent_sum <- df %>% 
+  drop_na(Year) %>% 
+  group_by(Year) %>% 
+  summarize(Count = n())
+
+# identify outliers
+df_year_deaths_recent_sum_out <- df_year_deaths_recent_sum %>% 
+  rstatix::identify_outliers(Count)
+
+
+# join tables and convert NA
+df_year_deaths_recent_sum <- left_join(df_year_deaths_recent_sum, df_year_deaths_recent_sum_out) %>% 
+  mutate(is.outlier = replace_na(is.outlier, FALSE)) %>% 
+  mutate(is.extreme = replace_na(is.extreme, FALSE))
+
+# Normality test
+df_year_deaths_recent_sum_sh_test <- shapiro.test(df_year_deaths_recent_sum$Count)
+
+# clean up temp files
+remove(df_year_deaths_recent_sum_out)
+
+### Yearly Deaths Not recent_sum Post Mortem ####
+# Get monthly totals
+df_year_deaths_not_recent_sum <- df %>% 
+  drop_na(Year) %>% 
+  group_by(Year) %>% 
+  summarize(Count = n())
+
+# identify outliers
+df_year_deaths_not_recent_sum_out <- df_year_deaths_not_recent_sum %>% 
+  rstatix::identify_outliers(Count)
+
+
+# join tables and convert NA
+df_year_deaths_not_recent_sum <- left_join(df_year_deaths_not_recent_sum, df_year_deaths_not_recent_sum_out) %>% 
+  mutate(is.outlier = replace_na(is.outlier, FALSE)) %>% 
+  mutate(is.extreme = replace_na(is.extreme, FALSE))
+
+# Normality test
+df_year_deaths_not_recent_sum_sh_test <- shapiro.test(df_year_deaths_not_recent_sum$Count)
+
+# clean up temp files
+remove(df_year_deaths_not_recent_sum_out)
+
+```
+
+
+Some fatalities indicate a long post mortem interval. Therefore, raw counts are a poor indicator of annual fatalities because some individuals were deceased more than a year. One approach to estimating trends in fatalities over time is to look only at annual averages among individuals with a comparatively "Recent" post mortem condition. Here "Recent" post mortem is defined as "< 1 day", "< 1 week", "< 3 weeks", "< 5 weeks", "< 3 months", and "< 6-8 months".
+
+Among fatalities with a Recent post mortem condition, meaning the individual likely died that year, there are an average of `r mean(df_year_deaths_recent_sum$Count)` fatalities encountered per year (SD= `r sd(df_year_deaths_recent_sum$Count)`). A Shapiro-Wilk test shows a significant different from a normal distribution ($W$= `r df_year_deaths_recent_sum_sh_test$statistic`, $p$= `r pvalue(df_year_deaths_recent_sum_sh_test$p.value, accuracy = 0.01)`. There are no outliers. The annual number of fatalities with Recent post mortem condition fluctuates over time.
+
+Is there any patterning to the number of individuals found over time with a Not Recent post mortem condition? Are there periods when a greater number of long since deceased individuals are encountered? "Not Recent" is defined as "> 6-8 months". Among fatalities with a Not Recent post mortem, meaning the individual likely died prior to that year, there are an average of `r mean(df_year_deaths_not_recent_sum$Count)` fatalities encountered per year (SD= `r sd(df_year_deaths_not_recent_sum$Count)`). A Shapiro-Wilk test shows a significant different from a normal distribution ($W$= `r df_year_deaths_not_recent_sum_sh_test$statistic`, $p$= `r pvalue(df_year_deaths_not_recent_sum_sh_test$p.value, accuracy = 0.01)`. There are no outliers. The annual number of fatalities with Not Recent post moretem condition is increasing over time.
+
+```{r plot-deaths-by-post-moretem, message=FALSE, warning=FALSE}
+
+df1 <- df_year_deaths_recent %>% 
+  drop_na(Year) %>% 
+  group_by(Year) %>% 
+  summarize(Count = n()) %>% 
+  mutate(`Post Mortem Interval` = "Recent")
+
+df2 <- df_year_deaths_not_recent %>% 
+  drop_na(Year) %>% 
+  group_by(Year) %>% 
+  summarize(Count = n()) %>% 
+  mutate(`Post Mortem Interval` = "Not Recent")
+
+df_temp <- rbind(df1, df2)
+df_temp$`Post Mortem Interval` <- fct_relevel(df_temp$`Post Mortem Interval`, "Recent")
+
+df_temp %>% 
+  ggplot(aes(x=Year,y=Count,col=`Post Mortem Interval`))+
+  geom_line()+
+  geom_smooth()+
+  scale_colour_brewer(palette = "Set1")+
+  scale_fill_brewer(palette="Set1")+
+  labs(title = "Fatalities Per Year by Post Mortem Interval",
+       caption = "Data Source: AZ OGIS https://humaneborders.info")
+
+remove(df_temp)
+```
+
+
+```{r plot-yearly-death-recent, eval=FALSE, include=FALSE}
+df_year_deaths_recent %>% 
+  drop_na(Year) %>% 
+  group_by(Year) %>% 
+  summarize(Count = n()) %>% 
+  ggplot(aes(x=Year, y=Count))+
+  geom_line()+
+  geom_smooth()+
+  
+  labs(title = "Low Post Mortem Interval Fatalities by Year",
+       caption = "Data Source: AZ OGIS https://humaneborders.info")+
+  ylab("Fatality Count")
+```
+
+```{r plot-yearly-death-not-recent, eval=FALSE, include=FALSE}
+df_year_deaths_not_recent %>% 
+  drop_na(Year) %>% 
+  group_by(Year) %>% 
+  summarize(Count = n()) %>% 
+  ggplot(aes(x=Year, y=Count))+
+  geom_line()+
+  geom_smooth()+
+  
+  labs(title = "Low Post Mortem Interval Fatalities by Year",
+       caption = "Data Source: AZ OGIS https://humaneborders.info")+
+  ylab("Fatality Count")
+```
+
+
+```{r reporting-date-stats, message=FALSE, warning=FALSE}
+
+### Pre Wall sample ###
+df_pre94 <- df %>% 
+  filter(Year <= 1994) %>% 
+  group_by(Year) %>% 
+  summarize(Count = n())
+
+### Post Wall sample ###
+df_post94 <- df %>% 
+  filter(Year >= 1994) %>% 
+  group_by(Year) %>% 
+  summarize(Count = n())
+
+### Duration ###
+pre94_years <- nrow(df_pre94)
+post94_years <- nrow(df_post94)
+
+### Counts ###
+pre94_sum <- sum(df_pre94$Count)
+post94_sum <- sum(df_post94$Count)
+
+###Mean and SD ###
+pre94_mean <- mean(df_pre94$Count)
+pre94_sd <- sd(df_pre94$Count)
+post94_mean <- mean(df_post94$Count)
+post94_sd <- sd(df_post94$Count)
+
+###  Normality tests ###
+pre94_sw_test <- shapiro.test(df_pre94$Count)
+post94_sw_test <- shapiro.test(df_post94$Count)
+
+### Variance test ###
+pre_post94_f_test <- var.test(df_pre94$Count, df_post94$Count)
+
+### Difference test###
+pre_post94_wrs_test <- wilcox.test(x=df_pre94$Count,
+            y = df_post94$Count,
+            paired = FALSE)
+```
+
+Border wall building began first in 1993 in along the San-Diego-Tijuana. In 1994 barrier construction expanded in three areas: Operation Safeguard in Arizona, Operation Gatekeeper in California, and Operation Hold-the-Line in Texas.
+
+Yearly fatalities were calculated pre and post 1994. Prior to 1994, there were `r pre94_sum` fatalities over `r pre94_years` years (M= `r pre94_mean`, SD= `r pre94_sd`). From 1994 and afterwards there are `r post94_sum` fatalities over `r post94_years` years (M= `r post94_mean`, SD= `r post94_sd`). A Shapiro-Wilk test finds annual fatality counts are normally distributed for the pre 1994 ($W$=`r pre94_sw_test$statistic`, $p$= `r pvalue(pre94_sw_test$p.value, accuracy = 0.01)`) but not post 1994 ($W$=`r pre94_sw_test$statistic`, $p$= `r pvalue(post94_sw_test$p.value, accuracy = 0.01)`) periods. 
+
+The Mann-Whitney U test is for nonparametric data and unpaired samples, and thus should be appropriate for this comparison. The Mann-Whitney test finds the pre 1994 and post 1994 yearly fatality counts are significantly different ($U$= `r pre_post94_wrs_test$statistic`, $p$= `r pvalue(pre_post94_wrs_test$p.value, accuracy = 0.01)`). On average, there are significantly more fatalities per year after the wall was built.
+
+<!-- 
+
+```{r boxplot-yearly-average-fatalities}
+df_year %>%
+  drop_na(Year) %>%
+  ggplot()+
+  aes(x="", y=Count)+
+  geom_boxplot()+
+  scale_colour_brewer(palette = "Set1")+
+  scale_fill_brewer(palette="Set1")+
+  labs(title = "Average Fatalities Per Year")+
+  theme(legend.position = "none")
+```
+
+```{r org-founding-dates}
+orgs <- c("Humane Borders", "Tucson Samaritans", "No More Deaths")
+founded <- c("June 2000", "July 2002", "2004")
+
+df_orgs <- tibble(Organizations = orgs,
+                  `Date of Founding` = founded)
+df_orgs %>%
+  kbl(caption = "Main humanitarian aid groups of southern AZ and their dates of founding.") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+```
+
+The three largest humanitarian aid groups of southern Arizona were founded between 2000-2004, a period of major increase in the number of annual fatalities identified (SEE TABLE.) Was there a significant increase in the number of deaths after the wall was built but before the establishment of humanitarian aid groups?
+
+```{r post94-pre200, message=FALSE, warning=FALSE}
+### Post Wall sample ###
+df_post94_pre2000 <- df %>% 
+  filter(Year <= 2000) %>% 
+  group_by(Year) %>% 
+  summarize(Count = n())
+
+### Duration ###
+post94_pre2000_years <- nrow(df_post94_pre2000)
+
+### Counts ###
+post94_pre2000_sum <- sum(df_post94_pre2000$Count)
+
+###Mean and SD ###
+post94_pre2000_mean <- mean(df_post94_pre2000$Count)
+post94_pre2000_sd <- sd(df_post94_pre2000$Count)
+
+###  Normality tests ###
+post94_pre2000_sw_test <- shapiro.test(df_post94_pre2000$Count)
+
+### Variance test ###
+pre_post94_f_test <- var.test(df_pre94$Count, df_post94_pre2000$Count)
+
+### Difference test###
+post94_pre2000_wrs_test <- wilcox.test(x=df_pre94$Count,
+            y = df_post94_pre2000$Count,
+            paired = FALSE)
+```
+
+In the `r post94_pre2000_years` years after the beginning of the wall and before the establishment of humanitarian aid groups, there are `r post94_pre2000_sum` fatalities. During this time, there was an average of `r post94_pre2000_mean` (SD= `r post94_pre2000_sd`) deaths identified per year, and the distribution is not normal ($W$= `r post94_pre2000_sw_test$statistic` , $p$= `r pvalue(post94_pre2000_sw_test$p.value, accuracy = 0.01)`). This represents an increase of `r post94_pre2000_mean - pre94_mean`  average number of deaths per year compared to the pre 1994 period. While there is an increase over time, a Mann-Whitney test finds no significant differences in the average number of deaths <= 1994 and between 1994 - 2000 ($U$= `r post94_pre2000_wrs_test$statistic`, $p$= `r pvalue(post94_pre2000_wrs_test$p.value, accuracy = 0.01)`). The lack of significance despite the dramatic rise in average number of deaths per year probably relates to the high standard deviation in annual deaths between 1995-2000.
+
+
+This slope plot is confusing. I may drop it.
+
+```{r}
+df_tmp <- df %>% 
+  drop_na(Year) %>% 
+  group_by(Year) %>% 
+  summarize(Count = n())
+
+df_tmp2 <- tibble(
+  Year = df_tmp$Year[df_tmp$Year>min(df_tmp$Year)],
+  Change = diff(df_tmp$Count) / diff(df_tmp$Year))
+
+df_tmp2 %>% 
+  ggplot(aes(x = Year, y = Change)) +
+  geom_line()+
+  geom_vline(xintercept=c(1994, 2011, 2017), linetype = "dashed")
+```
+
+ -->
+
+## Monthly Summaries
+
+```{r filter-deaths-month}
+df_deaths_recent <- df %>% 
+  filter(`Post Mortem Interval` %in% c("< 1 day", "< 1 week"))
+
+df_deaths_not_recent <- df %>% 
+  filter(`Post Mortem Interval` %in% c("< 3 months", "< 6-8 months", "> 6-8 months"))
+```
+
+```{r monthly-summaries, message=FALSE, warning=FALSE}
+
+### Fatalities All ####
+# Get monthly totals
+df_mon_sum_all <- df %>% 
+  drop_na(Year) %>% 
+  group_by(Month) %>% 
+  summarize(Count = n())
+
+# identify outliers
+df_mon_sum_all_out <- df_mon_sum_all %>% 
+  rstatix::identify_outliers(Count)
+
+# join tables and convert NA
+df_mon_sum_all <- left_join(df_mon_sum_all, df_mon_sum_all_out) %>% 
+  mutate(is.outlier = replace_na(is.outlier, FALSE)) %>% 
+  mutate(is.extreme = replace_na(is.extreme, FALSE))
+
+# Normality test
+df_mon_sum_all_sh_test <- shapiro.test(df_mon_sum_all$Count)
+
+# clean up temp files
+remove(df_mon_sum_all_out)
+
+
+### Fatalities < 1 Week ####
+# Get monthly totals
+df_mon_sum_recent <- df_deaths_recent %>% 
+  drop_na(Year) %>% 
+  group_by(Month) %>% 
+  summarize(Count = n())
+
+# identify outliers
+df_mon_sum_recent_out <- df_mon_sum_recent %>% 
+  rstatix::identify_outliers(Count)
+
+# join tables and convert NA
+df_mon_sum_recent <- left_join(df_mon_sum_recent, df_mon_sum_recent_out) %>% 
+  mutate(is.outlier = replace_na(is.outlier, FALSE)) %>% 
+  mutate(is.extreme = replace_na(is.extreme, FALSE))
+
+# Normality test
+df_mon_sum_recent_sh_test <- shapiro.test(df_mon_sum_recent$Count)
+
+# clean up temp files
+remove(df_mon_sum_recent_out)
+
+
+### Fatalities > 1 Week or Undetermined ####
+# Get monthly totals
+df_mon_sum_not_recent <- df_deaths_not_recent %>% 
+  drop_na(Year) %>% 
+  group_by(Month) %>% 
+  summarize(Count = n())
+
+# identify outliers
+df_mon_sum_not_recent_out <- df_mon_sum_not_recent %>% 
+  rstatix::identify_outliers(Count)
+
+# join tables and convert NA
+df_mon_sum_not_recent <- left_join(df_mon_sum_not_recent, df_mon_sum_not_recent_out) %>% 
+  mutate(is.outlier = replace_na(is.outlier, FALSE)) %>% 
+  mutate(is.extreme = replace_na(is.extreme, FALSE))
+
+# Normality test
+df_mon_sum_not_recent_sh_test <- shapiro.test(df_mon_sum_not_recent$Count)
+
+# clean up temp files
+remove(df_mon_sum_not_recent_out)
+
+
+```
+
+Looking at the entire AZ OGIS data set, there are an average of `r mean(df_mon_sum_all$Count)` (SD= `r sd(df_mon_sum_all$Count)`) fatalities reported per month. A Shapiro-Wilk normality test found the monthly count of fatalities reported is significantly different from a normal distribution ($W$= `r df_mon_sum_all_sh_test$statistic`, $p$= `r pvalue(df_mon_sum_all_sh_test$p.value, accuracy = 0.01)`). July has the highest average number of reported fatalities (n= `r df_mon_sum_all$Count[7]`) and is an outlier (Mdn=`r median(df_mon_sum_all$Count)`, IQR= `r IQR(df_mon_sum_all$Count)`).
+
+```{r histogram-monthly-fatalities}
+p1 <- df %>% 
+  drop_na(Year) %>% 
+  group_by(Month) %>% 
+  summarize(Count = n()) %>% 
+  ggplot(aes(x=Month, y=Count))+
+  geom_bar(stat = "identity")+
+  # labs(title = "Average Monthly Fatalities Reported",
+  #      caption = "Data Source: AZ OGIS https://humaneborders.info")+
+  ylab("Count")
+```
+
+```{r box-plot-monthly-fatalities}
+p2 <- df %>% 
+  drop_na(Year) %>% 
+  group_by(Month) %>% 
+  summarize(Count = n()) %>% 
+  ggplot()+
+  aes(x="", y=Count)+
+  geom_boxplot()+
+  xlab("Monthly Counts")
+```
+
+```{r combined-plot-monthly-fatalities}
+patchwork <- p1 + p2
+patchwork + 
+  plot_layout(widths = c(2,1))+
+  plot_annotation(
+    title = "Average Monthly Fatalities Reported",
+    caption = "Data Source: AZ OGIS https://humaneborders.info",
+    tag_levels = "A"
+    )
+```
+
+What if one just looks at monthly fatality averages when the Post Mortem Interval is less than one week? There are `r nrow(df_deaths_recent)` fatalities that have a Post Mortem Interval of < 1 week. Within this sub-sample where reporting date is close to the individual's passing, there are an average of `r mean(df_mon_sum_recent$Count)` (SD= `r sd(df_mon_sum_recent$Count)`) fatalities per month. A Shapiro-Wilk normality test found these monthly counts normally distributed ($W$= `r df_mon_sum_recent_sh_test$statistic`, $p$= `r pvalue(df_mon_sum_recent_sh_test$p.value, accuracy = 0.01)`), and no outliers were detected (Mdn=`r median(df_mon_sum_recent$Count)`, IQR= `r IQR(df_mon_sum_recent$Count)`). However, July still had the largest average number of fatalities (n= `r df_mon_sum_recent$Count[7]`).
+
+```{r histogram-monthly-fatalities-recent}
+#| fig.cap = "Histogram of monthly fatalities that have low Post Mortem Interval."
+p1 <- df_deaths_recent %>% 
+  drop_na(Year) %>% 
+  group_by(Month) %>% 
+  summarize(Count = n()) %>% 
+  ggplot(aes(x=Month, y=Count))+
+  geom_bar(stat = "identity")+
+  # labs(title = "Average monthly fatalities with low Post Mortem Interval",
+  #      caption = "Data Source: AZ OGIS https://humaneborders.info")+
+  ylab("Count")
+```
+
+```{r box-plot-monthly-fatalities-recent}
+#| fig.cap = "Boxplot of monthly fatalities that have low Post Mortem Interval."
+p2 <- df_deaths_recent %>% 
+  drop_na(Year) %>% 
+  group_by(Month) %>% 
+  summarize(Count = n()) %>% 
+  ggplot()+
+  aes(x="", y=Count)+
+  geom_boxplot()+
+  xlab("Monthly Counts")
+```
+
+```{r combined-plot-monthly-fatalities-recent}
+patchwork <- p1 + p2
+patchwork + 
+  plot_layout(widths = c(2,1))+
+  plot_annotation(
+    title = "Average Monthly Fatalities Reported with Recent Post Mortem Interval",
+    caption = "Data Source: AZ OGIS https://humaneborders.info",
+    tag_levels = "A"
+    )
+```
+
+Is there any patterning to monthly fatality averages when Post Mortem Interval is longer? There are `r nrow(df_deaths_not_recent)` fatalities that have a Post Mortem Interval of "< 3 months", "< 6-8 months", or "> 6-8 months". Within this sub-sample where there is a lapse of time between an individuals passing and reporting date, there are an average of `r mean(df_mon_sum_not_recent$Count)` (SD= `r sd(df_mon_sum_not_recent$Count)`) fatalities per month. A Shapiro-Wilk normality test found these monthly counts dignificantly different from a normal distribution ($W$= `r df_mon_sum_not_recent_sh_test$statistic`, $p$= `r pvalue(df_mon_sum_not_recent_sh_test$p.value, accuracy = 0.01)`). When there is a lag between death and reporting date, July has the highest average number of fatalities reported (n= `r df_mon_sum_not_recent$Count[7]`), and is an outlier based on IQR (Mdn=`r median(df_mon_sum_not_recent$Count)`, IQR= `r IQR(df_mon_sum_not_recent$Count)`).
+
+
+```{r histogram-monthly-fatalities-not-recent}
+#| fig.cap = "Histogram of monthly fatalities that have low Post Mortem Interval."
+p1 <- df_deaths_not_recent %>% 
+  drop_na(Year) %>% 
+  group_by(Month) %>% 
+  summarize(Count = n()) %>% 
+  ggplot(aes(x=Month, y=Count))+
+  geom_bar(stat = "identity")+
+  # labs(title = "Average monthly fatalities with low Post Mortem Interval",
+  #      caption = "Data Source: AZ OGIS https://humaneborders.info")+
+  ylab("Count")
+```
+
+```{r box-plot-monthly-fatalities-not-recent}
+#| fig.cap = "Boxplot of monthly fatalities that have low Post Mortem Interval."
+p2 <- df_deaths_not_recent %>% 
+  drop_na(Year) %>% 
+  group_by(Month) %>% 
+  summarize(Count = n()) %>% 
+  ggplot()+
+  aes(x="", y=Count)+
+  geom_boxplot()+
+  xlab("Monthly Counts")
+```
+
+```{r combined-plot-monthly-fatalities-not-recent}
+patchwork <- p1 + p2
+patchwork + 
+  plot_layout(widths = c(2,1))+
+  plot_annotation(
+    title = "Average Monthly Fatalities Reported with Not Recent Post Mortem Interval",
+    caption = "Data Source: AZ OGIS https://humaneborders.info",
+    tag_levels = "A"
+    )
+```
+
+## Monthly Fatalities in Relation to Temperature
+
+
+```{r load-temp, message=FALSE, warning=FALSE}
+df_temp <- read_csv("https://www.ncei.noaa.gov/data/normals-monthly/1991-2020/access/USC00028817.csv") %>% 
+  select(NAME, DATE, month,`MLY-TMAX-NORMAL`, `MLY-TMIN-NORMAL`) %>% 
+  rename(Month = month,
+         Max = `MLY-TMAX-NORMAL`,
+         Min = `MLY-TMIN-NORMAL`) %>% 
+  pivot_longer(.,Max:Min, names_to = "Type", values_to = "Fahrenheit")
+
+df_temp$Month <- as.factor(df_temp$Month) %>% 
+  recode(.,
+         "01" = "Jan",
+         "02" = "Feb",
+         "03" = "Mar",
+         "04" = "Apr",
+         "05" = "May",
+         "06" = "Jun",
+         "07" = "Jul",
+         "08" = "Aug",
+         "09" = "Sep",
+         "10" = "Oct",
+         "11" = "Nov",
+         "12" = "Dec")
+
+```
+
+```{r dfs-for-temp-death-correlation}
+# Montly average max temperature
+df_temp_mo <- df_temp %>% 
+  filter(Type == "Max") %>% 
+  group_by(Month)
+
+# Monthly average of fatalities with low post mortem interval
+df_deaths_recent_mo <- df_deaths_recent %>% 
+  group_by(Month) %>% 
+  summarise(Count = n())
+```
+
+```{r correlation-models, message=FALSE, warning=FALSE}
+df_correlation <- cbind(df_temp_mo, df_deaths_recent_mo)
+
+fahrenheit_count_cor <- cor.test(df_correlation$Fahrenheit, df_correlation$Count)
+fahrenheit_count_lm <- lm(Fahrenheit~Count, data = df_correlation) %>% summary()
+```
+
+The highest number of low post mortem interval facilitates is reported during the months of June and July. These are also the hottest months of the year. Is there a correlation between temperature and the number of fatalities?
+
+The Pearson's product-moment correlation found a strong positive correlation between average temperature and average reported fatalities with recent post mortem condition, $r$(`r fahrenheit_count_cor$parameter`) = `r fahrenheit_count_cor$estimate`, $p$= `r pvalue(fahrenheit_count_cor$p.value, accuracy = 0.01)`. Average temperature predicts average annual fatalities with recent post moretem condition, $R^2$= `r fahrenheit_count_lm$r.squared`, $F$(`r fahrenheit_count_lm$fstatistic[2]`,`r fahrenheit_count_lm$fstatistic[3]`) = `r fahrenheit_count_lm$fstatistic[1]`, $p$= `r pvalue(fahrenheit_count_lm$coefficients[,4][2], accuracy = 0.01)`, adj. $R^2$= `r fahrenheit_count_lm$adj.r.squared`.
+
+```{r plot-temp, message=FALSE, warning=FALSE}
+#| fig.cap = "Plot of monthly high, average, and low temperatures for Tucson, AZ."
+p1 <- df_temp %>% 
+  ggplot(aes(x=Month, y = Fahrenheit, group=Type, color = Type))+
+  geom_line()+
+  theme(legend.position = c(0.93, 0.85))+
+  labs(title = "NOAA Temperature Normals",
+       subtitle = "U of A, Tucson, AZ",
+       caption = "Data Source: NOAA https://www.ncei.noaa.gov/access/search/data-search/normals-monthly-1991-2020")+
+  scale_colour_brewer(palette = "Set1", name = "Temp")
+
+```
+
+```{r scatter-plot-temp-deaths, message=FALSE, warning=FALSE}
+p2 <- df_correlation %>% 
+  ggplot(aes(Fahrenheit, Count))+
+  geom_point()+
+  geom_smooth(method = "lm")
+```
+
+```{r fig.width=12, message=FALSE, warning=FALSE}
+patchwork <- p1 + p2
+patchwork + plot_annotation(
+  title = "Max Average Temperature and Low Post Mortem Interval Fatalities",
+  caption = "Data Source: AZ OGIS https://humaneborders.info",
+  tag_levels = "A"
+)
+```
+
+# Cause of Death
+
+```{r COD-summary, message=FALSE, warning=FALSE}
+# Obtain counts by Cause of Death
+df %>% 
+  group_by(`Cause of Death`) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  top_n(.,10) %>% 
+  kbl(caption="Top 10 Body Condition categories.") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+```
+
+```{r COD-tests}
+df_cod_all <- df %>% 
+  group_by(`Cause of Death`) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) 
+
+cod_undetermined <- df %>% filter(`Cause of Death` == "Undetermined") %>% nrow()
+cod_skeletal <- df %>% filter(`Cause of Death` == "Skeletal Remains") %>% nrow()
+
+`%notin%` <- Negate(`%in%`)
+
+df_cod_determined <- df %>% 
+  filter(`Cause of Death` %notin% c("Undetermined", "Skeletal Remains")) %>% 
+  group_by(`Cause of Death`) %>% 
+  summarise(Count = n()) %>% 
+  arrange(desc(Count)) 
+
+df_cod_determined_sh_test <- shapiro.test(df_cod_determined$Count)
+```
+
+```{r COD-outliers, message=FALSE, warning=FALSE}
+# identify outliers
+df_cod_determined_out <- df_cod_determined %>% 
+  rstatix::identify_outliers(Count)
+
+
+# join tables and convert NA
+df_cod_determined <- left_join(df_cod_determined, df_cod_determined_out) %>% 
+  mutate(is.outlier = replace_na(is.outlier, FALSE)) %>% 
+  mutate(is.extreme = replace_na(is.extreme, FALSE))
+
+# clean up temp object
+remove(df_cod_determined_out)
+
+outliers <- combine_words(df_cod_determined$`Cause of Death`[df_cod_determined$is.outlier == TRUE])
+ex_outliers <- combine_words(df_cod_determined$`Cause of Death`[df_cod_determined$is.extreme == TRUE])
+exposure_n <- df_cod_determined$Count[df_cod_determined$`Cause of Death` == "Exposure"]
+```
+
+
+The various offices of medical examiners who contributed data to OGIS list `r nrow(df_cod_all)-1` different causes of death. COD is Undetermined for `r (cod_undetermined/nrow(df))*100`% (n= `r cod_undetermined`) of the individuals. Additionally, Skeletal Remains are listed as COD for `r (cod_skeletal/nrow(df))*100`% (n= `r cod_skeletal`) of the individuals.
+
+Unfortunately, Skeletal Remains is not a cause of death but is instead a post mortem condition of the body that results from death. While some causes of death cannot be inferred from skeletal remains, some can be determined. Therefore, unless there is other information on those individuals whose COD is listed as Skeletal Remains, they are treated as Undetermined and not further considered.
+
+In OGIS, after filtering, this leaves `r sum(df_cod_determined$Count)/nrow(df)*100`% of the individuals (n= `r sum(df_cod_determined$Count)`) for whom COD is determined.
+
+A Shapiro-Wilk test shows significant difference from a normal distribution ($W$= `r df_cod_determined_sh_test$statistic`, $p$= `r pvalue(df_cod_determined_sh_test$statistic, accuracy = 0.01)`). 
+
+`r outliers` are outliers while `r ex_outliers` are extreme outliers.
+
+
+Exposure makes up `r exposure_n/nrow(df)*100`% (n= `r exposure_n`) of the individuals with known COD's.
+
+
+
+Exposure fatalities shows a peak during the summer months (FIGURE).
+
+
+Are some months more common for Exposure?
+Are some months more common for Skeletal Remains?
+
+```{r}
+df %>% 
+  filter(`Cause of Death` == "Exposure") %>% 
+  group_by(Month) %>% 
+  summarise(Count = n()) %>% 
+  ggplot(aes(x=Month, y=Count))+
+  geom_bar(stat = "identity")+
+  # labs(title = "Average Monthly Fatalities Reported",
+  #      caption = "Data Source: AZ OGIS https://humaneborders.info")+
+  ylab("Count")
+```
+
+
+
+```{r plot-COD-filtered}
+#| fig.cap = "Bar chart showing, in descending order, counts by cause of death category when an individual's COD is known."
+
+df_cod_determined %>%
+  # group_by(`Cause of Death`) %>% 
+  # summarise(n = n()) %>% 
+  # arrange(desc(n)) %>%
+    ggplot(aes(x=Count,
+             y=reorder(`Cause of Death`, Count)))+
+  geom_bar(stat = "identity")+
+
+  labs(title = "Causes of Death When COD is Determined",
+       caption = "Data Source: AZ OGIS https://humaneborders.info")+
+  scale_colour_brewer(palette = "Set1", name = "Temp")+
+  ylab("COD")+
+  xlab("Count of Fatalities")
+```
+
+
+```{r map-COD, message=FALSE, warning=FALSE}
+#| fig.cap = "Map of fatalities showing the 10 most common causes of death."
+df_cod <- df %>%
+  mutate(`Cause of Death` = fct_lump_n(`Cause of Death`, 10, other_level = "Other"))
+
+pal <- colorFactor(palette = "Set1",
+                   domain = df_cod$`Cause of Death`)
+
+df_cod %>% 
+  filter(Sex != "Undetermined") %>% 
+  leaflet() %>%
+  setView(lng = -112, lat = 33, zoom = 7.4) %>%  
+  addCircleMarkers(lng = ~Longitude,
+                   lat = ~Latitude,
+                   radius = 0.5,
+                   color = ~pal(`Cause of Death`),
+                   popup = df_cod$label) %>% 
+  addProviderTiles(providers$Esri.NatGeoWorldMap) %>% 
+  addMeasure() %>% 
+  addLegend(pal=pal, values = ~`Cause of Death`)
+
+remove(df_cod)
+```
+
+# Body Condition
+
+```{r table-COD}
+# Obtain counts by Body Condition
+df %>% 
+  group_by(`Body Condition`) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  kbl() %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+```
+
+```{r plot-COG}
+# Obtain counts by Body Condition
+df %>% 
+  group_by(`Body Condition`) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  ggplot(aes(x=n,
+             y=reorder(`Body Condition`, n)))+
+  geom_bar(stat = "identity")+
+  labs(title = "Body Condition",
+       caption = "Data Source: AZ OGIS https://humaneborders.info")+
+  scale_colour_brewer(palette = "Set1", name = "Temp")+
+  ylab("Condition")+
+  xlab("Count by Category")
+
+```
+
+# Post Mortem Interval
+
+```{r table-post-mortem}
+# Obtain counts by Post Mortem Interval
+df %>% 
+  group_by(`Post Mortem Interval`) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  kbl() %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+
+```
+
+```{r plot-post-mortem}
+# Obtain counts by Post Mortem Interval
+df_post_mortem <- df %>% 
+  # drop_na(`Post Mortem Interval`) %>% 
+  group_by(`Post Mortem Interval`) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n))
+
+df_post_mortem$`Post Mortem Interval` <- factor(df_post_mortem$`Post Mortem Interval`,
+                                               levels = c(
+                                                 "< 1 day",
+                                                 "< 1 week",
+                                                 "< 3 weeks",
+                                                 "< 5 weeks",
+                                                 "< 3 months",
+                                                 "< 6-8 months",
+                                                 "> 6-8 months",
+                                                 "Undetermined"
+                                               ))
+
+
+df_post_mortem %>% 
+  ggplot(aes(x=n,
+             y=`Post Mortem Interval`))+
+  geom_bar(stat = "identity")+
+  labs(title = "Post Mortem Interval",
+       caption = "Data Source: AZ OGIS https://humaneborders.info")+
+  scale_colour_brewer(palette = "Set1", name = "Temp")+
+  ylab("Post Mortem Interval")+
+  xlab("Count by Category")
+
+```
+
+<!-- comment 
+
+# General Summaries Still Pending
+
+```{r summaries}
+# Summarizing Data
+
+# Get the distinct categories
+# unique(df["Location Precision"])
+
+# Get the number of distinct categories
+# n_distinct(df["Location Precision"])
+
+# Obtain counts by Location Precision 
+df %>% 
+  group_by(`Location Precision`) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  kbl() %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+
+```
+
+# Comparisons between variables
+
+```{r plot-deaths-year-sex}
+df %>%
+ filter(!is.na(Sex),
+        !is.na(Age),
+        !is.na(`Reporting Date`),
+        Sex != "Undetermined") %>%
+ ggplot() +
+  aes(x = `Reporting Date`, fill = Sex, colour = Sex) +
+  geom_histogram(bins = 30L) +
+  labs(
+    x = "Year",
+    y = "Count",
+    title = "Histogram of Fatalities by Year and Sex",
+           caption = "Data Source: AZ OGIS https://humaneborders.info"
+  )+
+  scale_colour_brewer(palette = "Set1")+
+  scale_fill_brewer(palette="Set1")
+
+```
+
+```{r message=FALSE, warning=FALSE}
+
+df %>%
+  filter(`Reporting Date` >= "1999-05-22" & `Reporting Date` <= "2021-12-28" | is.na(`Reporting Date`),
+         Sex != "Undetermined",
+         Age < 99) %>%
+  ggplot() +
+  aes(x = `Reporting Date`, y = Age, colour = Sex) +
+  geom_point(shape = "circle", size = 1) +
+  geom_smooth()+
+  labs(title = "Age of Fatalities Over Time",
+       caption = "Data Source: AZ OGIS https://humaneborders.info")+
+  scale_colour_brewer(palette = "Set1")+
+  scale_fill_brewer(palette="Set1")
+
+
+
+```
+
+-->
+
+# Appendix A: List of Fatalities {-}
+
+```{r name-list}
+df_tmp <-  df %>% 
+  filter(`Full Name` != "Unidentified") %>% 
+  mutate(Age )
+
+df_tmp$Age[is.na(df_tmp$Age)] <- "?"
+
+name_list <- paste0(df_tmp$`Full Name`, " (", df_tmp$Age, ")")
+
+name_list <- knitr::combine_words(name_list)
+remove(df_tmp)
+```
+
+The identified fatalities are: `r name_list`.
+
+# Appendix B: Reading in Data {-}
+
+Consistent with efforts to master principles of reproducible research, one of my goals was read the Humane Borders fatalities data set directly from the web into R and ultimately ArcGIS. In the past, my practice involved downloading a CVS file from the website and then reading this file into an application from the local disk. Turns out that some hidden transformations occurred along the way that I never really noticed until I tried reading the CSV file directly from an API request sent to the server.
+
+When I pulled the data directly from the server using an API request URL I got one record fewer than if I saved the CSV file to the local disk and inspected it. Turns out that opening a CSV file in excel strips out quotation marks which can result in some unexpected results. In this case, opening the file in Excel resolved one issue that caused R to read in the proper number of records. However, Excel's silent removal of quotation marks causes problems properly interpreting diacritical characters. This is an issue because several names contain characters like: á, í, ñ, etc. Though initially, the raw file was not read properly by R I believe it is better to avoid opening the file in Excel. Fortunately, there are functions within R that can help identify the problems with the file. Generally, when working with CSV data, I believe it is better to inspect the file with a text editor like Notepad++ or Atom that will not make silent changes to the data structure.
+
+
+```{r csv-raw, message=FALSE, warning=FALSE}
+#| fig.cap="Raw CSV file downloaded directly from server and opened with Notepad++"
+knitr::include_graphics("https://i.imgur.com/hD7QMsj.png")
+```
+
+```{r csv-post-excel}
+#| fig.cap= "Same CSV file after having been opened by Excel. Note the quotation marks surrounding each field were stripped out of the file." 
+knitr::include_graphics("https://i.imgur.com/sfjRuE2.png")
+```
+
+
+```{r read-data-problems, message=FALSE, warning=FALSE}
+df_csv <- read_csv(here::here("data/ogis_migrant_deaths_21jan2022.csv"))
+df_csv_opened <- read_csv(here::here("data/ogis_migrant_deaths_21jan2022_opened.csv"))
+df_csv_unopened <- read_csv(here::here("data/ogis_migrant_deaths_21jan2022_plus.csv"))
+
+
+# Read data from API
+# this also does not work because of the error in line 541
+df_api <- read_csv(url("https://humaneborders.info/app/getTableByMultipleSearch.asp?sex=&cod=&county=&corridors=&sm=&years=&name=&detail=full&format=csv"))
+```
+
+
+Note `df_csv` contains 3816 observations while `df_api` contains 3815 observations. Using tests laid out below, I identified the record missing from `df_api` as `04-01090 FARIAS-AMADOR, MARICRUZ`. However, while that is the missing record. It is the prior record that is causing the problem.
+
+I submitted the api request url to an online [testing](https://reqbin.com/) tool. The data returned contained the missing record. Therefore, the server is sending the record. It seems like the record is dropped during the read stage. I copied the text from the testing tool into a file, named it csv. That file contains the missing record. When I read it with `read_csv()` the record was missing.
+
+Using the `problems()` function helped to pretty quickly identify the issue. Turns out there is an extra quotation mark in one of the field of record `04-01085 GOMEZ HERRERA, ISMAEL`. In the `df_csv_api` this is line number 541.
+
+The error is in the file being sent from the server. The added quote mark does not raise an issue with Excel, but it will raise an issue with other programs. The text in question is `"HYPERTHERMIA; AS A CONSEQUENCE OF\" EXPOSURE TO THE ELEMENTS"` I believe it is the excaped quote that causses the problem.
+
+```{r}
+include_graphics("https://i.imgur.com/rzfi3ok.png")
+```
+
+
+![Imgur](https://i.imgur.com/rzfi3ok.png)
+
+I took a fresh copy of the file and opened it in Notepad++ and removed `\"` from line 541.
+
+For line 541, one of the fields originally reads: `"Exposure","HYPERTHERMIA; AS A CONSEQUENCE OF\" EXPOSURE TO THE ELEMENTS"`
+
+It should read: `"Exposure","HYPERTHERMIA; AS A CONSEQUENCE OF EXPOSURE TO THE ELEMENTS"`
+
+After doing this the file reads properly into ArcGIS. It can be import as a CSV which sidesteps the problem with Excel messing with the names. The change to the file also makes it possible to properly read into R and Excel.
+
+I'm not sure how to deal with this programmatically. Ideally, the escaped quote would be taken out of the original data. In the mean time, I can make a note to myself to fix this record.
+
+

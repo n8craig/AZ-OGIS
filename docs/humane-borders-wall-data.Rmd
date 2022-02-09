@@ -1,0 +1,89 @@
+---
+title: "Untitled"
+author: "Nathan Craig"
+date: "2/8/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(geojsonio)
+library(ggplot2)
+library(httr)
+library(leaflet)
+library(sf)
+```
+
+# Read GeoJSON with `geojsonio`
+
+This library converts the file into an `sp`.
+
+```{r}
+spdf <- geojson_read(here::here("data/query.json"),  what = "sp")
+```
+
+
+
+[sp Gallery](https://edzer.github.io/sp/) and a useful SO [answer](https://stackoverflow.com/a/50213419/13110995) when importing and plotting.
+
+```{r}
+# plot(spdf)
+```
+
+## Leaflet plot using SP
+```{r}
+leaflet(data = spdf) %>% 
+  addPolylines()
+```
+
+## Leaflet plot with additional styling
+Note this is the same as doing it with `sf`. However, I figured it out first with `sf`.
+```{r}
+# Color pallet
+pal <- colorFactor(palette = "Set1",
+                   domain = spdf$Project_Status)
+
+# Popup column
+spdf$label <-  paste0(spdf$Project_Name1,"<br>",
+                         "Length: ", spdf$Project_Length, "<br>",
+                         "<a href=\"",spdf$`Image`,"\">","Photo","</a>")
+
+# Plot
+leaflet(data = spdf) %>% 
+  addPolylines(color = ~pal(Project_Status),
+               popup = spdf$label)
+```
+
+
+
+# Convert SP to SF and trying again
+
+## Conversion
+```{r}
+sfdf <- st_as_sf(spdf)
+```
+
+
+## Leaflet plot using SF
+
+Once I got this working, I did find and replate to direct the code to the `sp` data frame. It seems to work fine.
+
+```{r}
+# Color pallet
+pal_wall <- colorFactor(palette = "Dark2",
+                   domain = sfdf$Project_Status)
+
+# Popup column
+sfdf$label <-  paste0(sfdf$Project_Name1,"<br>",
+                         "Length: ", sfdf$Project_Length, "<br>",
+                         "<a href=\"",sfdf$`Image`,"\">","Photo","</a>")
+# Plot
+leaflet(data = sfdf) %>% 
+  addPolylines(color = ~pal_wall(Project_Status),
+               popup = sfdf$label) %>% 
+  addLegend("bottomright", pal = pal_wall, values = ~Project_Status)
+```
+
